@@ -1,0 +1,14 @@
+# Env and secrets
+.env
+.env.local
+*.env
+
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
