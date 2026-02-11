@@ -452,6 +452,7 @@ async def run_limit_order_test(
         min_amount = max(min_amount, min_notional_amt)
 
     propagation_list: List[float] = []
+    limit_success_count = 0
     _pending_orders.clear()
     _first_seen_cache.clear()
 
@@ -544,7 +545,12 @@ async def run_limit_order_test(
                     rec = _pending_orders.get(oid)
                     if rec and rec.get("first_seen_ns") is not None:
                         prop_ms = (rec["first_seen_ns"] - t0_ns) / 1e6
-                        propagation_list.append(prop_ms)
+                        limit_success_count += 1
+                        if limit_success_count == 1:
+                            print(f"  Order {oid}: prop={prop_ms:.2f} ms [SKIPPED from stats - cold start]")
+                        else:
+                            propagation_list.append(prop_ms)
+                            print(f"  Order {oid}: prop={prop_ms:.2f} ms")
                 except asyncio.TimeoutError:
                     print(f"  Timeout waiting for order {oid} on WS")
                 finally:
