@@ -41,21 +41,11 @@ def get_env_config() -> Tuple[str, str]:
     return api_key, secret
 
 
-def get_proxy_from_env() -> Optional[str]:
-    """从环境变量读取代理：MEXC_PROXY > HTTPS_PROXY > HTTP_PROXY."""
-    for key in ("MEXC_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
-        v = os.environ.get(key, "").strip()
-        if v:
-            return v
-    return None
-
-
 def build_exchange(
     api_key: str,
     secret: str,
     market_type: str,  # 'spot' | 'swap'
     timeout_ms: int = 60000,
-    proxy: Optional[str] = None,
 ) -> ccxt.Exchange:
     """Build ccxt async MEXC exchange."""
     options: Dict[str, Any] = {}
@@ -68,12 +58,6 @@ def build_exchange(
         "timeout": timeout_ms,
         "enableRateLimit": True,
     }
-    if proxy:
-        if proxy.lower().startswith("socks"):
-            config["socksProxy"] = proxy
-        else:
-            # ccxt 只允许设置一种 proxy，MEXC API 为 HTTPS，故仅设 httpsProxy
-            config["httpsProxy"] = proxy
     return ccxt.mexc(config)
 
 
@@ -163,24 +147,6 @@ def _get_transact_time_ms(order: dict) -> Optional[int]:
     return None
 
 
-# MEXC 部分交易对仅支持 Web 交易，API 会返回 10007。按顺序尝试以下备用标的。
-FALLBACK_SPOT_SYMBOLS = ["WBTC/USDT"]
-FALLBACK_SWAP_SYMBOLS = ["ETH/USDT:USDT", "MX/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"]
-
-
-def _is_symbol_not_supported_error(e: Exception) -> bool:
-    """是否 MEXC 10007：该 symbol 不支持 API 交易."""
-    msg = str(e).lower()
-    return "10007" in msg or "symbol not support" in msg
-
-
-def _pick_fallback_symbols(markets: dict, market_type: str, requested: str) -> List[str]:
-    """返回可用于 10007 备选的交易对列表（仅包含 markets 中存在的）."""
-    candidates = FALLBACK_SWAP_SYMBOLS if market_type == "swap" else FALLBACK_SPOT_SYMBOLS
-    out = [s for s in candidates if s in markets and s != requested]
-    return out
-
-
 async def run_market_order_test(
     exchange: ccxt.Exchange,
     symbol: str,
@@ -197,26 +163,18 @@ async def run_market_order_test(
     # MEXC 现货市价单要求最小交易额 1 USDT（code 30002）
     MIN_NOTIONAL_USDT = 1.0
 
-    fallback_list = _pick_fallback_symbols(markets, market_type, symbol)
-    actual_symbol = symbol
-    tried: List[str] = []
+    m = markets[symbol]
+    min_amt = max(
+        m.get("limits", {}).get("amount", {}).get("min", 0) or 1e-8,
+        1e-8,
+    )
+    if market_type != "spot":
+        amount, order_params = min(min_amt, 0.0001), {}
+    else:
+        amount, order_params = 0, {"cost": MIN_NOTIONAL_USDT}
 
-    async def _get_amount_and_params(sym: str) -> Tuple[float, Dict[str, Any]]:
-        """返回 (amount, params)。现货市价买用 params['cost']=1USDT 满足最小额."""
-        m = markets[sym]
-        min_amt = max(
-            m.get("limits", {}).get("amount", {}).get("min", 0) or 1e-8,
-            1e-8,
-        )
-        if market_type != "spot":
-            return min(min_amt, 0.0001), {}
-        # 现货市价买：用 quoteOrderQty/cost 指定 1 USDT，满足 MEXC 最小 1USDT
-        return 0, {"cost": MIN_NOTIONAL_USDT}
-
-    amount, order_params = await _get_amount_and_params(actual_symbol)
     local_list: List[float] = []
     server_list: List[float] = []
-    already_warned_fallback = False
     success_count = 0
 
     for i in range(runs):
@@ -225,59 +183,16 @@ async def run_market_order_test(
         order = None
         try:
             order = await exchange.create_order(
-                symbol=actual_symbol,
+                symbol=symbol,
                 type="market",
                 side="buy",
                 amount=amount,
                 params=order_params,
             )
         except Exception as e:
-            if _is_symbol_not_supported_error(e):
-                tried.append(actual_symbol)
-                next_symbol = None
-                for fb in fallback_list:
-                    if fb not in tried and fb in markets:
-                        next_symbol = fb
-                        break
-                if next_symbol and (actual_symbol == symbol or actual_symbol in fallback_list):
-                    if not already_warned_fallback:
-                        print(f"  Symbol {actual_symbol} not supported for API (10007), trying fallback: {next_symbol}\n")
-                        already_warned_fallback = True
-                    actual_symbol = next_symbol
-                    amount, order_params = await _get_amount_and_params(actual_symbol)
-                    try:
-                        order = await exchange.create_order(
-                            symbol=actual_symbol,
-                            type="market",
-                            side="buy",
-                            amount=amount,
-                            params=order_params,
-                        )
-                    except Exception as retry_e:
-                        if _is_symbol_not_supported_error(retry_e):
-                            print(f"  Run {i+1}/{runs} create_order failed: {retry_e}")
-                            print(
-                                "  All tried symbols returned 10007. Please check:\n"
-                                "  1) API key has **Spot Trading** permission: https://www.mexc.com/user/openapi\n"
-                                "  2) The key is not restricted to other symbols only.\n"
-                            )
-                        else:
-                            print(f"  Run {i+1}/{runs} create_order failed: {retry_e}")
-                        await asyncio.sleep(1)
-                        continue
-                else:
-                    print(f"  Run {i+1}/{runs} create_order failed: {e}")
-                    if not already_warned_fallback:
-                        print(
-                            "  Tip: If every symbol returns 10007, enable **Spot Trading** for your API key at https://www.mexc.com/user/openapi\n"
-                        )
-                        already_warned_fallback = True
-                    await asyncio.sleep(1)
-                    continue
-            else:
-                print(f"  Run {i+1}/{runs} create_order failed: {e}")
-                await asyncio.sleep(1)
-                continue
+            print(f"  Run {i+1}/{runs} create_order failed: {e}")
+            await asyncio.sleep(1)
+            continue
 
         if order is None:
             continue
@@ -312,7 +227,7 @@ async def run_market_order_test(
         info = order.get("info") or {}
         transact_time_raw = info.get("transactTime", "N/A")
 
-        print(f"    Symbol       : {actual_symbol}")
+        print(f"    Symbol       : {symbol}")
         print(f"    Order ID     : {oid}")
         print(f"    Status       : {status}")
         print(f"    Filled       : {filled}")
@@ -405,36 +320,19 @@ async def run_limit_order_test(
     if symbol not in markets:
         raise SystemExit(f"Symbol not found: {symbol}")
 
-    fallback_list = _pick_fallback_symbols(markets, market_type, symbol)
-    actual_symbol = symbol
-
-    # 获取参考价并构造不会成交的限价（买单价略低于当前最低卖价）
-    mid = 0.0
-    candidates = [actual_symbol] + [s for s in fallback_list if s in markets]
-    for candidate in candidates:
-        if candidate not in markets:
-            continue
-        try:
-            ticker = await exchange.fetch_ticker(candidate)
-            mid = float(ticker.get("last") or ticker.get("close") or 0)
-            if not mid:
-                ob = await exchange.fetch_order_book(candidate, limit=5)
-                mid = (ob["bids"][0][0] + ob["asks"][0][0]) / 2
-            if mid:
-                actual_symbol = candidate
-                break
-        except Exception as e:
-            if _is_symbol_not_supported_error(e):
-                print(f"  Symbol {candidate} not supported for API (10007), trying next.\n")
-                continue
-            raise SystemExit(f"Cannot get price for {candidate}: {e}")
+    # Get reference price for the limit order
+    try:
+        ticker = await exchange.fetch_ticker(symbol)
+        mid = float(ticker.get("last") or ticker.get("close") or 0)
+        if not mid:
+            ob = await exchange.fetch_order_book(symbol, limit=5)
+            mid = (ob["bids"][0][0] + ob["asks"][0][0]) / 2
+    except Exception as e:
+        raise SystemExit(f"Cannot get price for {symbol}: {e}")
     if not mid:
-        raise SystemExit(
-            f"Cannot get price for any of {candidates}. "
-            "Check API key has Spot Trading permission: https://www.mexc.com/user/openapi"
-        )
+        raise SystemExit(f"Cannot get price for {symbol}")
 
-    m = markets[actual_symbol]
+    m = markets[symbol]
     min_amount = max(
         m.get("limits", {}).get("amount", {}).get("min", 0) or 1e-8,
         1e-8,
@@ -469,9 +367,8 @@ async def run_limit_order_test(
         try:
             api_key = getattr(exchange, "apiKey", None) or (exchange.options or {}).get("apiKey")
             secret = getattr(exchange, "secret", None)
-            proxy = getattr(exchange, "httpsProxy", None) or getattr(exchange, "proxy", None)
             if api_key and secret:
-                listen_key = await get_listen_key(api_key, secret, proxy)
+                listen_key = await get_listen_key(api_key, secret)
 
                 def _on_order(push_oid: str, first_seen_ns: int) -> None:
                     push_oid = push_oid.strip('"')
@@ -488,7 +385,7 @@ async def run_limit_order_test(
                             rec["event"].set()
                             break
 
-                user_ws = MEXCUserOrdersWS(listen_key, on_order=_on_order, proxy=proxy, ping_interval=25.0)
+                user_ws = MEXCUserOrdersWS(listen_key, on_order=_on_order, ping_interval=25.0)
                 await user_ws.connect()
                 user_ws_task = asyncio.create_task(user_ws.run_forever())
                 await asyncio.sleep(1.2)
@@ -498,7 +395,7 @@ async def run_limit_order_test(
             print(f"  MEXC User Data WS unavailable ({e}), using fallback.\n")
 
     if not use_mexc_user_ws:
-        _ws_task = asyncio.create_task(_watch_orders_consumer(exchange, actual_symbol))
+        _ws_task = asyncio.create_task(_watch_orders_consumer(exchange, symbol))
         await asyncio.sleep(1.0)
 
     async def place_one_limit_order() -> Optional[Tuple[str, int, asyncio.Event]]:
@@ -506,7 +403,7 @@ async def run_limit_order_test(
         t0_ns = time.perf_counter_ns()
         try:
             order = await exchange.create_order(
-                symbol=actual_symbol,
+                symbol=symbol,
                 type="limit",
                 side="buy",
                 amount=min_amount,
@@ -560,7 +457,7 @@ async def run_limit_order_test(
 
         # 测试结束后撤单
         try:
-            await exchange.cancel_all_orders(actual_symbol)
+            await exchange.cancel_all_orders(symbol)
         except Exception as e:
             print(f"  Cancel all orders warning: {e}")
     finally:
@@ -677,7 +574,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rtt", type=int, default=0, help="Extra RTT test runs (0=disable)")
     p.add_argument("--warmup", type=int, default=5, help="Warm-up request count")
     p.add_argument("--timeout", type=int, default=60000, help="HTTP request timeout in ms (default 60000)")
-    p.add_argument("--proxy", type=str, default=None, help="HTTP(S) or SOCKS proxy URL (e.g. http://127.0.0.1:7890). Overrides MEXC_PROXY/HTTPS_PROXY.")
     return p.parse_args()
 
 
@@ -688,13 +584,9 @@ async def main_async() -> None:
     if args.type == "swap" and ":USDT" not in args.symbol and "/USDT" in args.symbol:
         args.symbol = args.symbol + ":USDT"
 
-    proxy = args.proxy or get_proxy_from_env()
-    if proxy:
-        print(f"Config: type={args.type}, method={args.method}, symbol={args.symbol}, runs={args.runs}, concurrent={args.concurrent}, proxy=ON\n")
-    else:
-        print(f"Config: type={args.type}, method={args.method}, symbol={args.symbol}, runs={args.runs}, concurrent={args.concurrent}\n")
+    print(f"Config: type={args.type}, method={args.method}, symbol={args.symbol}, runs={args.runs}, concurrent={args.concurrent}\n")
 
-    exchange = build_exchange(api_key, secret, args.type, timeout_ms=args.timeout, proxy=proxy)
+    exchange = build_exchange(api_key, secret, args.type, timeout_ms=args.timeout)
     try:
         await warm_up(exchange, count=args.warmup)
     except Exception as e:
