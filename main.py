@@ -217,6 +217,7 @@ async def run_market_order_test(
     local_list: List[float] = []
     server_list: List[float] = []
     already_warned_fallback = False
+    success_count = 0
 
     for i in range(runs):
         t0_ns = time.perf_counter_ns()
@@ -282,7 +283,8 @@ async def run_market_order_test(
             continue
         t1_ns = time.perf_counter_ns()
         local_ms = (t1_ns - t0_ns) / 1e6
-        local_list.append(local_ms)
+        success_count += 1
+        is_first = (success_count == 1)
 
         transact_ms = _get_transact_time_ms(order)
         server_ms_val: Optional[float] = None
@@ -292,7 +294,14 @@ async def run_market_order_test(
                 server_ms_val = transact_ms - (request_ts_ms + clock_offset_ms)
             else:
                 server_ms_val = transact_ms - request_ts_ms
-            server_list.append(server_ms_val)
+        # Skip first successful run from statistics (cold-start latency)
+        if is_first:
+            print(f"  --- Run {i+1}/{runs} [SKIPPED from stats - cold start] ---")
+        else:
+            local_list.append(local_ms)
+            if server_ms_val is not None:
+                server_list.append(server_ms_val)
+            print(f"  --- Run {i+1}/{runs} ---")
 
         # ---- Verbose per-run output ----
         oid = order.get("id") or order.get("clientOrderId") or "N/A"
@@ -303,7 +312,6 @@ async def run_market_order_test(
         info = order.get("info") or {}
         transact_time_raw = info.get("transactTime", "N/A")
 
-        print(f"  --- Run {i+1}/{runs} ---")
         print(f"    Symbol       : {actual_symbol}")
         print(f"    Order ID     : {oid}")
         print(f"    Status       : {status}")
