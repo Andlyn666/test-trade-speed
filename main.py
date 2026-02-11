@@ -309,10 +309,11 @@ async def run_limit_order_test(
     exchange: ccxt.Exchange,
     symbol: str,
     runs: int,
-    concurrent: int,
+    batch: int,
     market_type: str = "swap",
-) -> List[float]:
-    """限价单上架测试：返回 WS propagation 延迟列表 (ms)."""
+    clock_offset_ms: Optional[float] = None,
+) -> Tuple[List[float], List[float], List[float]]:
+    """Limit order test: returns (local_latencies_ms, server_latencies_ms, ws_propagation_ms)."""
     global _pending_orders, _ws_task, _first_seen_cache
     _ws_task = None
 
@@ -349,8 +350,9 @@ async def run_limit_order_test(
         min_notional_amt = math.ceil(min_notional_amt * p) / p
         min_amount = max(min_amount, min_notional_amt)
 
+    local_list: List[float] = []
+    server_list: List[float] = []
     propagation_list: List[float] = []
-    limit_success_count = 0
     _pending_orders.clear()
     _first_seen_cache.clear()
 
@@ -398,64 +400,109 @@ async def run_limit_order_test(
         _ws_task = asyncio.create_task(_watch_orders_consumer(exchange, symbol))
         await asyncio.sleep(1.0)
 
-    async def place_one_limit_order() -> Optional[Tuple[str, int, asyncio.Event]]:
-        ev = asyncio.Event()
-        t0_ns = time.perf_counter_ns()
-        try:
-            order = await exchange.create_order(
-                symbol=symbol,
-                type="limit",
-                side="buy",
-                amount=min_amount,
-                price=limit_price,
-                params={},
-            )
-            oid = str(order.get("id") or order.get("clientOrderId") or "")
-            if not oid:
-                return None
-            first_ns = _first_seen_cache.get(oid)
-            _pending_orders[oid] = {
-                "t0_ns": t0_ns,
-                "event": ev,
-                "first_seen_ns": first_ns,
-                "order_id": oid,
+    def _build_batch_orders(n: int) -> List[dict]:
+        """Build a list of order dicts for create_orders."""
+        return [
+            {
+                "symbol": symbol,
+                "type": "limit",
+                "side": "buy",
+                "amount": min_amount,
+                "price": limit_price,
             }
-            if first_ns is not None:
-                ev.set()
-            return (oid, t0_ns, ev)
-        except Exception as e:
-            print(f"  Limit order create failed: {e}")
-            return None
+            for _ in range(n)
+        ]
 
     try:
-        for batch_start in range(0, runs, concurrent):
-            batch_size = min(concurrent, runs - batch_start)
-            results = await asyncio.gather(
-                *[place_one_limit_order() for _ in range(batch_size)]
-            )
-            batch_tasks = [(r[0], r[1], r[2]) for r in results if r is not None]
+        for batch_idx in range(runs):
+            # Cancel previous batch orders before placing new ones
+            if batch_idx > 0:
+                try:
+                    await exchange.cancel_all_orders(symbol)
+                except Exception as e:
+                    print(f"  Cancel previous batch warning: {e}")
+                await asyncio.sleep(0.2)
 
-            # 等待本批次所有订单在 WS 上首次出现（最多 15 秒）
-            for oid, t0_ns, ev in batch_tasks:
+            print(f"  ====== Batch {batch_idx + 1}/{runs} ({batch} orders) ======")
+            t0_ns = time.perf_counter_ns()
+            request_ts_ms = int(time.time() * 1000)
+            try:
+                orders = await exchange.create_orders(_build_batch_orders(batch))
+            except Exception as e:
+                print(f"  Batch create_orders failed: {e}")
+                continue
+            t1_ns = time.perf_counter_ns()
+
+            if not isinstance(orders, list):
+                orders = [orders]
+
+            # Register all orders for WS tracking
+            batch_tasks = []
+            for order in orders:
+                oid = str(order.get("id") or order.get("clientOrderId") or "")
+                if not oid:
+                    continue
+                ev = asyncio.Event()
+                first_ns = _first_seen_cache.get(oid)
+                _pending_orders[oid] = {
+                    "t0_ns": t0_ns,
+                    "event": ev,
+                    "first_seen_ns": first_ns,
+                    "order_id": oid,
+                }
+                if first_ns is not None:
+                    ev.set()
+                batch_tasks.append((oid, t0_ns, t1_ns, request_ts_ms, order, ev))
+
+            for oid, t0_ns, t1_ns, request_ts_ms, order, ev in batch_tasks:
+                # Compute local & server latency from REST response
+                local_ms = (t1_ns - t0_ns) / 1e6
+                transact_ms = _get_transact_time_ms(order)
+                server_ms_val: Optional[float] = None
+                if transact_ms is not None:
+                    if clock_offset_ms is not None:
+                        server_ms_val = transact_ms - (request_ts_ms + clock_offset_ms)
+                    else:
+                        server_ms_val = transact_ms - request_ts_ms
+
+                # Wait for WS push
+                prop_ms: Optional[float] = None
                 try:
                     await asyncio.wait_for(ev.wait(), timeout=15.0)
                     rec = _pending_orders.get(oid)
                     if rec and rec.get("first_seen_ns") is not None:
                         prop_ms = (rec["first_seen_ns"] - t0_ns) / 1e6
-                        limit_success_count += 1
-                        if limit_success_count == 1:
-                            print(f"  Order {oid}: prop={prop_ms:.2f} ms [SKIPPED from stats - cold start]")
-                        else:
-                            propagation_list.append(prop_ms)
-                            print(f"  Order {oid}: prop={prop_ms:.2f} ms")
                 except asyncio.TimeoutError:
                     print(f"  Timeout waiting for order {oid} on WS")
                 finally:
                     _pending_orders.pop(oid, None)
 
+                is_first_batch = (batch_idx == 0)
+
+                if is_first_batch:
+                    print(f"  --- Order {oid} [SKIPPED from stats - cold start batch] ---")
+                else:
+                    local_list.append(local_ms)
+                    if server_ms_val is not None:
+                        server_list.append(server_ms_val)
+                    if prop_ms is not None:
+                        propagation_list.append(prop_ms)
+                    print(f"  --- Order {oid} ---")
+
+                print(f"    Local Latency: {local_ms:.2f} ms")
+                if server_ms_val is not None:
+                    print(f"    Server Lat.  : {server_ms_val:.2f} ms")
+                else:
+                    print(f"    Server Lat.  : N/A")
+                if prop_ms is not None:
+                    print(f"    WS Propagation: {prop_ms:.2f} ms")
+                else:
+                    print(f"    WS Propagation: timeout")
+                print()
+
             await asyncio.sleep(0.2)
 
-        # 测试结束后撤单
+        # Cancel remaining orders after last batch
         try:
             await exchange.cancel_all_orders(symbol)
         except Exception as e:
@@ -476,7 +523,7 @@ async def run_limit_order_test(
             except asyncio.CancelledError:
                 pass
 
-    return propagation_list
+    return local_list, server_list, propagation_list
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +617,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--method", choices=["market", "limit"], default="market", help="market | limit")
     p.add_argument("--symbol", type=str, default="BTC/USDT", help="e.g. BTC/USDT or BTC/USDT:USDT for swap")
     p.add_argument("--runs", type=int, default=10, help="Number of test runs")
-    p.add_argument("--concurrent", type=int, default=1, help="Concurrent limit orders per batch (for --method limit)")
+    p.add_argument("--batch", type=int, default=1, help="Number of limit orders per batch (for --method limit)")
     p.add_argument("--rtt", type=int, default=0, help="Extra RTT test runs (0=disable)")
     p.add_argument("--warmup", type=int, default=5, help="Warm-up request count")
     p.add_argument("--timeout", type=int, default=60000, help="HTTP request timeout in ms (default 60000)")
@@ -584,7 +631,7 @@ async def main_async() -> None:
     if args.type == "swap" and ":USDT" not in args.symbol and "/USDT" in args.symbol:
         args.symbol = args.symbol + ":USDT"
 
-    print(f"Config: type={args.type}, method={args.method}, symbol={args.symbol}, runs={args.runs}, concurrent={args.concurrent}\n")
+    print(f"Config: type={args.type}, method={args.method}, symbol={args.symbol}, runs={args.runs}, batch={args.batch}\n")
 
     exchange = build_exchange(api_key, secret, args.type, timeout_ms=args.timeout)
     try:
@@ -600,18 +647,19 @@ async def main_async() -> None:
     rtt_list: Optional[List[float]] = None
 
     try:
+        clock_offset_ms: Optional[float] = await get_clock_offset_ms(exchange)
+        if clock_offset_ms is not None:
+            print(f"  Clock offset (server - client): {clock_offset_ms:+.0f} ms\n")
+
         if args.method == "market":
-            clock_offset_ms: Optional[float] = await get_clock_offset_ms(exchange)
-            if clock_offset_ms is not None:
-                print(f"  Clock offset (server − client): {clock_offset_ms:+.0f} ms\n")
             local_list, server_list = await run_market_order_test(
                 exchange, args.symbol, args.runs, market_type=args.type, clock_offset_ms=clock_offset_ms
             )
         else:
-            ws_list = await run_limit_order_test(
-                exchange, args.symbol, args.runs, args.concurrent, market_type=args.type
+            local_list, server_list, ws_list = await run_limit_order_test(
+                exchange, args.symbol, args.runs, args.batch,
+                market_type=args.type, clock_offset_ms=clock_offset_ms,
             )
-            # 限价单模式不直接得到 HTTP 往返，可选做一次 RTT
             if args.rtt > 0:
                 rtt_list = await run_rtt_test(exchange, runs=args.rtt)
 
