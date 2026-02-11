@@ -4,6 +4,7 @@ MEXC Latency Tester - 从 AWS 东京到 MEXC 撮合引擎的延迟压测工具.
 """
 import argparse
 import asyncio
+import json
 import math
 import os
 import time
@@ -284,15 +285,42 @@ async def run_market_order_test(
         local_list.append(local_ms)
 
         transact_ms = _get_transact_time_ms(order)
+        server_ms_val: Optional[float] = None
         if transact_ms is not None:
             if clock_offset_ms is not None:
                 # 校正：request_ts 是 client 时间，加上 offset 得到 server 时间轴下的“请求发出”时刻
-                server_ms = transact_ms - (request_ts_ms + clock_offset_ms)
+                server_ms_val = transact_ms - (request_ts_ms + clock_offset_ms)
             else:
-                server_ms = transact_ms - request_ts_ms
-            server_list.append(server_ms)
+                server_ms_val = transact_ms - request_ts_ms
+            server_list.append(server_ms_val)
 
-        await asyncio.sleep(0.3)  # 降低 rate limit 风险
+        # ---- Verbose per-run output ----
+        oid = order.get("id") or order.get("clientOrderId") or "N/A"
+        status = order.get("status") or "N/A"
+        filled = order.get("filled") or order.get("amount") or "N/A"
+        avg_price = order.get("average") or order.get("price") or "N/A"
+        cost = order.get("cost") or "N/A"
+        info = order.get("info") or {}
+        transact_time_raw = info.get("transactTime", "N/A")
+
+        print(f"  --- Run {i+1}/{runs} ---")
+        print(f"    Symbol       : {actual_symbol}")
+        print(f"    Order ID     : {oid}")
+        print(f"    Status       : {status}")
+        print(f"    Filled       : {filled}")
+        print(f"    Avg Price    : {avg_price}")
+        print(f"    Cost         : {cost}")
+        print(f"    Local Latency: {local_ms:.2f} ms")
+        print(f"    request_ts   : {request_ts_ms} (client wall-clock ms)")
+        print(f"    transactTime : {transact_time_raw} (server ms)")
+        if server_ms_val is not None:
+            print(f"    Server Lat.  : {server_ms_val:.2f} ms (transactTime - adjusted request_ts)")
+        else:
+            print(f"    Server Lat.  : N/A (transactTime missing)")
+        print(f"    Raw info     : {json.dumps(info, default=str, ensure_ascii=False)}")
+        print()
+
+        await asyncio.sleep(0.3)  # rate limit
 
     return local_list, server_list
 
