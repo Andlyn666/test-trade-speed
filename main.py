@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MEXC Latency Tester - 从 AWS 东京到 MEXC 撮合引擎的延迟压测工具.
+Exchange Latency Tester - MEXC / Binance spot & swap 延迟压测工具.
 """
 import argparse
 import asyncio
@@ -21,33 +21,52 @@ import pandas as pd
 from tabulate import tabulate
 
 try:
-    from mexc_user_ws import get_listen_key, MEXCUserOrdersWS
+    from mexc_user_ws import get_listen_key as mexc_get_listen_key, MEXCUserOrdersWS
 except ImportError:
-    get_listen_key = None  # type: ignore
+    mexc_get_listen_key = None  # type: ignore
     MEXCUserOrdersWS = None  # type: ignore
+
+try:
+    from binance_user_ws import get_listen_key as binance_get_listen_key, BinanceUserOrdersWS
+except ImportError:
+    binance_get_listen_key = None  # type: ignore
+    BinanceUserOrdersWS = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
 # Config & Exchange
 # ---------------------------------------------------------------------------
 
-def get_env_config() -> Tuple[str, str]:
-    api_key = os.environ.get("MEXC_API_KEY", "").strip()
-    secret = os.environ.get("MEXC_SECRET", "").strip()
+def get_env_config(exchange: str) -> Tuple[str, str]:
+    """Get API key and secret for the given exchange."""
+    prefix = exchange.upper()
+    api_key = os.environ.get(f"{prefix}_API_KEY", "").strip()
+    secret = os.environ.get(f"{prefix}_SECRET", "").strip()
     if not api_key or not secret:
         raise SystemExit(
-            "Error: Set MEXC_API_KEY and MEXC_SECRET in environment or .env file."
+            f"Error: Set {prefix}_API_KEY and {prefix}_SECRET in environment or .env file."
         )
     return api_key, secret
 
 
+def get_proxy_from_env() -> Optional[str]:
+    """Read proxy from env: MEXC_PROXY/BINANCE_PROXY > HTTPS_PROXY > HTTP_PROXY."""
+    for key in ("MEXC_PROXY", "BINANCE_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
+        v = os.environ.get(key, "").strip()
+        if v:
+            return v
+    return None
+
+
 def build_exchange(
+    exchange: str,
     api_key: str,
     secret: str,
     market_type: str,  # 'spot' | 'swap'
     timeout_ms: int = 60000,
+    proxy: Optional[str] = None,
 ) -> ccxt.Exchange:
-    """Build ccxt async MEXC exchange."""
+    """Build ccxt async exchange (mexc or binance)."""
     options: Dict[str, Any] = {}
     if market_type == "swap":
         options["defaultType"] = "swap"
@@ -58,7 +77,19 @@ def build_exchange(
         "timeout": timeout_ms,
         "enableRateLimit": True,
     }
-    return ccxt.mexc(config)
+    if proxy:
+        if proxy.lower().startswith("socks"):
+            config["socksProxy"] = proxy
+        else:
+            config["httpsProxy"] = proxy
+
+    if exchange == "mexc":
+        return ccxt.mexc(config)
+    if exchange == "binance":
+        if market_type == "swap":
+            return ccxt.binanceusdm(config)
+        return ccxt.binance(config)
+    raise SystemExit(f"Unknown exchange: {exchange}")
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +154,22 @@ async def warm_up(exchange: ccxt.Exchange, count: int = 5) -> None:
         await asyncio.sleep(0.2)
     if failed == 0:
         print(f"  Warm-up done ({count} requests).\n")
-    else:
+    elif failed < count:
         print(f"  Warm-up done ({count} requests, {failed} failed).\n")
         if first_error_detail:
             print("  First failure details (for debugging fetch_time):")
             for line in first_error_detail.splitlines():
                 print(f"    {line}")
             print("  Tip: Try --timeout 90000 if the network is slow or use a VPN closer to MEXC.\n")
+    else:
+        # All requests failed - cannot proceed
+        print(f"  Warm-up FAILED: all {count} requests failed.\n")
+        if first_error_detail:
+            for line in first_error_detail.splitlines():
+                print(f"    {line}")
+        raise RuntimeError(
+            "All warm-up requests failed. Check network connectivity and proxy settings."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +193,7 @@ async def run_market_order_test(
     runs: int,
     market_type: str = "spot",
     clock_offset_ms: Optional[float] = None,
+    exchange_name: str = "mexc",
 ) -> Tuple[List[float], List[float]]:
     """市价单测试：返回 (local_latencies_ms, server_latencies_ms).
     若提供 clock_offset_ms (server - client)，则 Server Latency = transactTime - (request_ts + offset)."""
@@ -160,10 +201,11 @@ async def run_market_order_test(
     if symbol not in markets:
         raise SystemExit(f"Symbol not found: {symbol}")
 
-    # MEXC 现货市价单要求最小交易额 1 USDT（code 30002）
-    MIN_NOTIONAL_USDT = 1.0
-
     m = markets[symbol]
+    min_notional = m.get("limits", {}).get("cost", {}).get("min")
+    if min_notional is None or min_notional <= 0:
+        min_notional = 10.0 if exchange_name == "binance" else 1.0
+    MIN_NOTIONAL_USDT = float(min_notional)
     min_amt = max(
         m.get("limits", {}).get("amount", {}).get("min", 0) or 1e-8,
         1e-8,
@@ -312,6 +354,7 @@ async def run_limit_order_test(
     batch: int,
     market_type: str = "swap",
     clock_offset_ms: Optional[float] = None,
+    exchange_name: str = "mexc",
 ) -> Tuple[List[float], List[float], List[float]]:
     """Limit order test: returns (local_latencies_ms, server_latencies_ms, ws_propagation_ms)."""
     global _pending_orders, _ws_task, _first_seen_cache
@@ -342,13 +385,20 @@ async def run_limit_order_test(
     limit_price = round(mid * 0.80, 8)
     if limit_price <= 0:
         limit_price = 0.01
-    # MEXC 现货最小交易额 1 USDT：amount * price >= 1，向上取整避免舍入后不足
+    # 满足最小名义价值 (NOTIONAL): amount * price >= min_notional
+    min_notional = m.get("limits", {}).get("cost", {}).get("min")
+    if min_notional is None or min_notional <= 0:
+        min_notional = 15.0 if exchange_name == "binance" else 1.0  # Binance 保守 15 USDT
     if market_type == "spot" and limit_price > 0:
-        min_notional_amt = 1.01 / limit_price  # 略大于 1 避免舍入误差
-        prec = m.get("precision", {}).get("amount")
-        p = 10 ** (prec if isinstance(prec, int) else 8)
-        min_notional_amt = math.ceil(min_notional_amt * p) / p
+        min_notional_amt = (min_notional * 1.1) / limit_price  # 留 10% 余量应付 precision 舍入
+        step = m.get("precision", {}).get("amount")
+        if step is not None and step > 0:
+            min_notional_amt = math.ceil(min_notional_amt / step) * step  # Binance 用 stepSize
+        else:
+            p = 10 ** 8
+            min_notional_amt = math.ceil(min_notional_amt * p) / p
         min_amount = max(min_amount, min_notional_amt)
+    # 同时确保 price 符合 tickSize（由 ccxt 在 create_order 时处理）
 
     local_list: List[float] = []
     server_list: List[float] = []
@@ -356,47 +406,58 @@ async def run_limit_order_test(
     _pending_orders.clear()
     _first_seen_cache.clear()
 
-    # 优先使用 MEXC 官方用户订单流（User Data Stream），否则用 ccxt watch_orders 或 REST 轮询
-    use_mexc_user_ws = (
-        market_type == "spot"
-        and get_listen_key is not None
-        and MEXCUserOrdersWS is not None
-    )
+    # Use exchange-specific user data stream when available, else watch_orders
+    use_user_ws = False
     user_ws_task: Optional[asyncio.Task] = None
     user_ws: Optional[Any] = None
 
-    if use_mexc_user_ws:
+    def _on_order(push_oid: str, first_seen_ns: int) -> None:
+        push_oid = str(push_oid).strip('"')
+        if not push_oid:
+            return
+        if push_oid not in _first_seen_cache:
+            _first_seen_cache[push_oid] = first_seen_ns
+        for oid, rec in list(_pending_orders.items()):
+            if rec.get("first_seen_ns"):
+                continue
+            if oid == push_oid or oid in push_oid or push_oid in oid:
+                rec["first_seen_ns"] = _first_seen_cache.get(push_oid, first_seen_ns)
+                rec["event"].set()
+                break
+
+    if exchange_name == "mexc" and market_type == "spot" and mexc_get_listen_key and MEXCUserOrdersWS:
         try:
             api_key = getattr(exchange, "apiKey", None) or (exchange.options or {}).get("apiKey")
             secret = getattr(exchange, "secret", None)
             if api_key and secret:
-                listen_key = await get_listen_key(api_key, secret)
-
-                def _on_order(push_oid: str, first_seen_ns: int) -> None:
-                    push_oid = push_oid.strip('"')
-                    if not push_oid:
-                        return
-                    if push_oid not in _first_seen_cache:
-                        _first_seen_cache[push_oid] = first_seen_ns
-                    # 匹配 pending：推送的 clientId 可能与 create_order 返回的 id 格式不同
-                    for oid, rec in list(_pending_orders.items()):
-                        if rec.get("first_seen_ns"):
-                            continue
-                        if oid == push_oid or oid in push_oid or push_oid in oid:
-                            rec["first_seen_ns"] = _first_seen_cache.get(push_oid, first_seen_ns)
-                            rec["event"].set()
-                            break
-
-                user_ws = MEXCUserOrdersWS(listen_key, on_order=_on_order, ping_interval=25.0)
+                ws_proxy = getattr(exchange, "httpsProxy", None) or getattr(exchange, "socksProxy", None)
+                listen_key = await mexc_get_listen_key(api_key, secret, proxy=ws_proxy)
+                user_ws = MEXCUserOrdersWS(listen_key, on_order=_on_order, proxy=ws_proxy, ping_interval=25.0)
                 await user_ws.connect()
                 user_ws_task = asyncio.create_task(user_ws.run_forever())
                 await asyncio.sleep(1.2)
+                use_user_ws = True
                 print("  Using MEXC User Data WebSocket for order stream.\n")
         except Exception as e:
-            use_mexc_user_ws = False
             print(f"  MEXC User Data WS unavailable ({e}), using fallback.\n")
 
-    if not use_mexc_user_ws:
+    if exchange_name == "binance" and binance_get_listen_key and BinanceUserOrdersWS:
+        try:
+            api_key = getattr(exchange, "apiKey", None) or (exchange.options or {}).get("apiKey")
+            secret = getattr(exchange, "secret", None)
+            if api_key and secret:
+                ws_proxy = getattr(exchange, "httpsProxy", None) or getattr(exchange, "socksProxy", None)
+                listen_key = await binance_get_listen_key(api_key, secret, market_type, proxy=ws_proxy)
+                user_ws = BinanceUserOrdersWS(listen_key, market_type, on_order=_on_order, proxy=ws_proxy)
+                await user_ws.connect()
+                user_ws_task = asyncio.create_task(user_ws.run_forever())
+                await asyncio.sleep(1.2)
+                use_user_ws = True
+                print(f"  Using Binance User Data WebSocket for order stream.\n")
+        except Exception as e:
+            print(f"  Binance User Data WS unavailable ({e}), using fallback.\n")
+
+    if not use_user_ws:
         _ws_task = asyncio.create_task(_watch_orders_consumer(exchange, symbol))
         await asyncio.sleep(1.0)
 
@@ -413,6 +474,24 @@ async def run_limit_order_test(
             for _ in range(n)
         ]
 
+    # MEXC spot, Binance futures support create_orders; others use create_order
+    use_batch_api = (
+        (exchange_name == "mexc" and market_type == "spot")
+        or (exchange_name == "binance" and market_type == "swap")
+    )
+
+    async def _place_batch_orders() -> List[dict]:
+        """Place batch orders via create_orders or multiple create_order."""
+        if use_batch_api:
+            return await exchange.create_orders(_build_batch_orders(batch))
+        results = await asyncio.gather(
+            *[
+                exchange.create_order(symbol, "limit", "buy", min_amount, limit_price)
+                for _ in range(batch)
+            ]
+        )
+        return [r for r in results if r is not None]
+
     try:
         for batch_idx in range(runs):
             # Cancel previous batch orders before placing new ones
@@ -427,9 +506,9 @@ async def run_limit_order_test(
             t0_ns = time.perf_counter_ns()
             request_ts_ms = int(time.time() * 1000)
             try:
-                orders = await exchange.create_orders(_build_batch_orders(batch))
+                orders = await _place_batch_orders()
             except Exception as e:
-                print(f"  Batch create_orders failed: {e}")
+                print(f"  Batch create orders failed: {e}")
                 continue
             t1_ns = time.perf_counter_ns()
 
@@ -573,8 +652,10 @@ def print_results(
     server_latencies: List[float],
     ws_propagations: Optional[List[float]] = None,
     rtt_latencies: Optional[List[float]] = None,
+    exchange: str = "mexc",
 ) -> None:
     """以表格输出各指标."""
+    print(f"\n--- Results: {exchange} {market_type} {symbol} ({method}) ---\n")
     rows = []
 
     if local_latencies:
@@ -611,8 +692,9 @@ def print_results(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="MEXC Latency Tester - 现货/合约 市价单与限价单延迟压测",
+        description="Exchange Latency Tester - MEXC/Binance spot & swap 延迟压测",
     )
+    p.add_argument("--exchange", choices=["mexc", "binance"], default="mexc", help="mexc | binance")
     p.add_argument("--type", choices=["spot", "swap"], default="spot", help="spot | swap")
     p.add_argument("--method", choices=["market", "limit"], default="market", help="market | limit")
     p.add_argument("--symbol", type=str, default="BTC/USDT", help="e.g. BTC/USDT or BTC/USDT:USDT for swap")
@@ -621,19 +703,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rtt", type=int, default=0, help="Extra RTT test runs (0=disable)")
     p.add_argument("--warmup", type=int, default=5, help="Warm-up request count")
     p.add_argument("--timeout", type=int, default=60000, help="HTTP request timeout in ms (default 60000)")
+    p.add_argument("--proxy", type=str, default=None, help="HTTP(S) or SOCKS proxy URL. Overrides MEXC_PROXY/BINANCE_PROXY env.")
     return p.parse_args()
 
 
 async def main_async() -> None:
     args = parse_args()
-    api_key, secret = get_env_config()
+    api_key, secret = get_env_config(args.exchange)
 
     if args.type == "swap" and ":USDT" not in args.symbol and "/USDT" in args.symbol:
         args.symbol = args.symbol + ":USDT"
 
-    print(f"Config: type={args.type}, method={args.method}, symbol={args.symbol}, runs={args.runs}, batch={args.batch}\n")
+    proxy = args.proxy or get_proxy_from_env()
+    if proxy:
+        proxy_source = "CLI" if args.proxy else "env"
+        proxy_info = f", proxy={proxy} ({proxy_source})"
+    else:
+        proxy_info = ""
+    print(f"Config: exchange={args.exchange}, type={args.type}, method={args.method}, symbol={args.symbol}, runs={args.runs}, batch={args.batch}{proxy_info}\n")
 
-    exchange = build_exchange(api_key, secret, args.type, timeout_ms=args.timeout)
+    exchange = build_exchange(args.exchange, api_key, secret, args.type, timeout_ms=args.timeout, proxy=proxy)
     try:
         await warm_up(exchange, count=args.warmup)
     except Exception as e:
@@ -653,12 +742,14 @@ async def main_async() -> None:
 
         if args.method == "market":
             local_list, server_list = await run_market_order_test(
-                exchange, args.symbol, args.runs, market_type=args.type, clock_offset_ms=clock_offset_ms
+                exchange, args.symbol, args.runs, market_type=args.type, clock_offset_ms=clock_offset_ms,
+                exchange_name=args.exchange,
             )
         else:
             local_list, server_list, ws_list = await run_limit_order_test(
                 exchange, args.symbol, args.runs, args.batch,
                 market_type=args.type, clock_offset_ms=clock_offset_ms,
+                exchange_name=args.exchange,
             )
             if args.rtt > 0:
                 rtt_list = await run_rtt_test(exchange, runs=args.rtt)
@@ -676,6 +767,7 @@ async def main_async() -> None:
         server_latencies=server_list,
         ws_propagations=ws_list,
         rtt_latencies=rtt_list,
+        exchange=args.exchange,
     )
 
 

@@ -1,7 +1,7 @@
 
-# MEXC 交易延迟压测工具 (MEXC Latency Tester)
+# Exchange 交易延迟压测工具 (MEXC / Binance Latency Tester)
 
-本项目是一个基于 `Python` 和 `ccxt` 的高性能测试工具，旨在精准测量从 **AWS 东京机房** 到 **MEXC (抹茶)** 撮合引擎的网络与处理延迟。
+本项目是一个基于 `Python` 和 `ccxt` 的高性能测试工具，支持 **MEXC** 和 **Binance** 现货与合约的延迟压测。
 
 ## 1. 测试维度
 
@@ -56,29 +56,45 @@ pip install -r requirements.txt
 在运行前，请通过环境变量配置（推荐使用项目根目录下的 `.env` 文件，勿提交到版本库）：
 
 ```bash
-# .env 示例
+# .env 示例 - MEXC
 MEXC_API_KEY=YOUR_MEXC_API_KEY
 MEXC_SECRET=YOUR_MEXC_SECRET
-# 若直连 MEXC 超时（如地区限制），可设置代理（可选）
+
+# .env 示例 - Binance
+BINANCE_API_KEY=YOUR_BINANCE_API_KEY
+BINANCE_SECRET=YOUR_BINANCE_SECRET
+
+# 代理（可选）
 # MEXC_PROXY=http://127.0.0.1:7890
+# BINANCE_PROXY=http://127.0.0.1:7890
 ```
 
-运行时也可通过 `--proxy http://127.0.0.1:7890` 指定代理；未设置时自动读取环境变量 `MEXC_PROXY`、`HTTPS_PROXY` 或 `HTTP_PROXY`。
+运行时也可通过 `--proxy http://127.0.0.1:7890` 指定代理；未设置时自动读取环境变量。
 
 ### 运行测试
 
-**模式 A：单次基准测试（现货市价单）**
+**MEXC 现货市价单**
 
 ```bash
-python main.py --type spot --method market --symbol BTC/USDT --runs 10
-
+python main.py --exchange mexc --type spot --method market --symbol BTC/USDT --runs 10
 ```
 
-**模式 B：高并发上架测试（合约限价单）**
+**MEXC 合约限价单**
 
 ```bash
-python main.py --type swap --method limit --symbol BTC/USDT:USDT --runs 50 --concurrent 5
+python main.py --exchange mexc --type swap --method limit --symbol BTC/USDT:USDT --runs 50 --batch 5
+```
 
+**Binance 现货市价单**
+
+```bash
+python main.py --exchange binance --type spot --method market --symbol BTC/USDT --runs 10
+```
+
+**Binance 合约限价单**
+
+```bash
+python main.py --exchange binance --type swap --method limit --symbol BTC/USDT:USDT --runs 50 --batch 5
 ```
 
 ---

@@ -38,6 +38,7 @@ def _sign(secret: str, query_and_body: str) -> str:
 async def get_listen_key(
     api_key: str,
     secret: str,
+    proxy: Optional[str] = None,
 ) -> str:
     """POST /api/v3/userDataStream to get listenKey."""
     ts = int(time.time() * 1000)
@@ -46,6 +47,8 @@ async def get_listen_key(
     url = f"{MEXC_API_BASE}/api/v3/userDataStream?timestamp={ts}&signature={sig}"
     headers = {"X-MEXC-APIKEY": api_key, "Content-Type": "application/json"}
     kwargs: Dict[str, Any] = {"headers": headers}
+    if proxy:
+        kwargs["proxy"] = proxy
     async with aiohttp.ClientSession() as session:
         async with session.post(url, **kwargs) as resp:
             resp.raise_for_status()
@@ -67,10 +70,12 @@ class MEXCUserOrdersWS:
         self,
         listen_key: str,
         on_order: Optional[Callable[[str, int], None]] = None,
+        proxy: Optional[str] = None,
         ping_interval: float = 30.0,
     ):
         self.listen_key = listen_key
         self.on_order = on_order
+        self.proxy = proxy
         self.ping_interval = ping_interval
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
@@ -81,8 +86,11 @@ class MEXCUserOrdersWS:
         return f"{MEXC_WS_BASE}?listenKey={self.listen_key}"
 
     async def connect(self) -> None:
+        kwargs: Dict[str, Any] = {}
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
         self._session = aiohttp.ClientSession()
-        self._ws = await self._session.ws_connect(self.url)
+        self._ws = await self._session.ws_connect(self.url, **kwargs)
 
     async def close(self) -> None:
         if self._ping_task and not self._ping_task.done():

@@ -64,9 +64,11 @@ class MEXCSpotWS:
         self,
         url: str = MEXC_WS_URL,
         ping_interval: float = 30.0,
+        proxy: Optional[str] = None,
     ):
         self.url = url
         self.ping_interval = ping_interval
+        self.proxy = proxy
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._subscriptions: List[str] = []
@@ -75,8 +77,11 @@ class MEXCSpotWS:
 
     async def connect(self) -> None:
         """Open WebSocket connection."""
+        kwargs: Dict[str, Any] = {}
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
         self._session = aiohttp.ClientSession()
-        self._ws = await self._session.ws_connect(self.url)
+        self._ws = await self._session.ws_connect(self.url, **kwargs)
 
     async def close(self) -> None:
         """Close WebSocket and session."""
@@ -247,7 +252,8 @@ class MEXCSpotWS:
 async def demo() -> None:
     """Subscribe to trades and book ticker for BTCUSDT, print control and binary info."""
     import os
-    ws = MEXCSpotWS(ping_interval=25.0)
+    proxy = os.environ.get("MEXC_PROXY") or os.environ.get("HTTPS_PROXY")
+    ws = MEXCSpotWS(ping_interval=25.0, proxy=proxy)
     channels = [
         channel_deals("BTC/USDT", "100ms"),
         channel_book_ticker("BTC/USDT", "100ms"),
