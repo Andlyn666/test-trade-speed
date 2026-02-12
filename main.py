@@ -579,7 +579,7 @@ async def run_limit_order_test(
                     print(f"    WS Propagation: timeout")
                 print()
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1)
 
         # Cancel remaining orders after last batch
         try:
